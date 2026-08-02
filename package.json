@@ -1,0 +1,37 @@
+{
+  "name": "pi-runtime-stats",
+  "version": "0.1.0",
+  "description": "Pi extension: turn/step timing, TTFT, decode rate, prompt-cache hit rates and session busy ratio in the footer, plus a live per-request timer",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/n-WN/pi-runtime-stats.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "telemetry",
+    "metrics",
+    "statusline",
+    "footer",
+    "timing"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    "./package.json": "./package.json"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/runtime-stats.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
