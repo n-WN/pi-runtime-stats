@@ -11,7 +11,7 @@
  *   decode 120t/s  output rate measured over the streaming window
  *   cache 99.8%    prompt-cache hit rate of the latest LLM call
  *   avg 74.8%      prompt-cache hit rate across the whole session
- *   session 12m03s wall time since the session started
+ *   session 12m03s wall time since the session started (minutes while idle)
  *   busy 68%       share of session time the agent was actually working
  *   turns 7        completed turns
  *
@@ -31,11 +31,18 @@
  * arrive together, the decode window collapses to ~0, and a tokens/second
  * figure computed from it would be meaningless. Those responses are detected
  * and reported as `decode n/a(bulk)` instead of an invented number.
+ *
+ * Cost: every ctx.ui.setStatus() call makes pi re-render the whole TUI, and the
+ * render cost grows with the transcript. So the footer is re-sent only when its
+ * text changes, the 4 Hz ticker runs only while the agent works, and the idle
+ * footer uses minute precision so that it changes at most once a minute.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_KEY = "runtime-stats";
 const TICK_MS = 250;
+/** Idle cadence. The idle footer only changes once a minute, see durMinutes(). */
+const IDLE_TICK_MS = 15_000;
 /** Decode window shorter than this fraction of the response ⇒ treat as buffered. */
 const BULK_RATIO = 0.05;
 
@@ -66,6 +73,17 @@ export default function (pi: ExtensionAPI) {
   let lastWasBulk = false;
 
   let ticker: ReturnType<typeof setInterval> | undefined;
+  let tickerMs: number | undefined;
+  /** Last status text sent to pi. Every setStatus() call makes pi re-render the TUI. */
+  let lastStatus: string | undefined;
+
+  // Incremental cache totals. Session entries are append-only within one session.
+  let scanned = 0;
+  let lastScannedEntry: unknown;
+  let sumInput = 0;
+  let sumRead = 0;
+  let sumWrite = 0;
+  let lastNow: number | undefined;
 
   /**
    * Walks session entries once and derives both cache figures.
@@ -73,12 +91,19 @@ export default function (pi: ExtensionAPI) {
    * `avg` is the cumulative session ratio.
    */
   function cacheHits(ctx: ExtensionContext): { now?: number; avg?: number } {
-    let input = 0;
-    let read = 0;
-    let write = 0;
-    let now: number | undefined;
     try {
-      for (const entry of ctx.sessionManager.getEntries() as any[]) {
+      const entries = ctx.sessionManager.getEntries() as any[];
+      // Rescan from the start when the entry list is not an extension of the last scan
+      // (session switch, fork, tree navigation).
+      if (scanned > entries.length || (scanned > 0 && entries[scanned - 1] !== lastScannedEntry)) {
+        scanned = 0;
+        sumInput = 0;
+        sumRead = 0;
+        sumWrite = 0;
+        lastNow = undefined;
+      }
+      for (; scanned < entries.length; scanned++) {
+        const entry = entries[scanned];
         const isAssistant =
           entry?.type === "message" && entry.message?.role === "assistant";
         const u: Usage | undefined =
@@ -89,20 +114,21 @@ export default function (pi: ExtensionAPI) {
               : undefined;
         if (!u) continue;
 
-        input += u.input ?? 0;
-        read += u.cacheRead ?? 0;
-        write += u.cacheWrite ?? 0;
+        sumInput += u.input ?? 0;
+        sumRead += u.cacheRead ?? 0;
+        sumWrite += u.cacheWrite ?? 0;
 
         if (isAssistant) {
           const prompt = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
-          now = prompt > 0 ? ((u.cacheRead ?? 0) / prompt) * 100 : undefined;
+          lastNow = prompt > 0 ? ((u.cacheRead ?? 0) / prompt) * 100 : undefined;
         }
       }
+      lastScannedEntry = entries[scanned - 1];
     } catch {
       return {};
     }
-    const prompt = input + read + write;
-    return { now, avg: prompt > 0 ? (read / prompt) * 100 : undefined };
+    const prompt = sumInput + sumRead + sumWrite;
+    return { now: lastNow, avg: prompt > 0 ? (sumRead / prompt) * 100 : undefined };
   }
 
   /** Live per-request timer in the "Working…" row. */
@@ -153,14 +179,18 @@ export default function (pi: ExtensionAPI) {
       if (avg !== undefined) parts.push(kv("avg", `${avg.toFixed(1)}%`));
 
       const elapsed = Date.now() - sessionStart;
-      parts.push(kv("session", dur(elapsed)));
+      parts.push(kv("session", isBusy() ? dur(elapsed) : durMinutes(elapsed)));
       const liveBusy = busyMs + (turnStart !== undefined ? Date.now() - turnStart : 0);
       if (elapsed > 0 && liveBusy > 0) {
         parts.push(kv("busy", `${Math.min(100, (liveBusy / elapsed) * 100).toFixed(0)}%`));
       }
       if (turnCount > 0) parts.push(kv("turns", String(turnCount)));
 
-      ctx.ui.setStatus(STATUS_KEY, parts.join(t.fg("muted", "  ")));
+      const status = parts.join(t.fg("muted", "  "));
+      if (status !== lastStatus) {
+        lastStatus = status;
+        ctx.ui.setStatus(STATUS_KEY, status);
+      }
     } catch {
       /* never break the session over a status line */
     }
@@ -169,6 +199,7 @@ export default function (pi: ExtensionAPI) {
   /** (Re)start the ticker; optionally reset all counters. Idempotent. */
   function arm(ctx: ExtensionContext, resetClock: boolean) {
     if (resetClock) {
+      lastStatus = undefined; // pi may have cleared the status line
       sessionStart = Date.now();
       busyMs = 0;
       turnCount = 0;
@@ -182,9 +213,21 @@ export default function (pi: ExtensionAPI) {
       lastOutputTokens = undefined;
       lastWasBulk = false;
     }
-    if (ticker) clearInterval(ticker);
-    ticker = setInterval(() => render(ctx), TICK_MS);
+    schedule(ctx);
     render(ctx);
+  }
+
+  function isBusy(): boolean {
+    return turnStart !== undefined || dispatchAt !== undefined;
+  }
+
+  /** Fast ticks only while the agent works; slow ticks while idle. Idempotent. */
+  function schedule(ctx: ExtensionContext) {
+    const want = isBusy() ? TICK_MS : IDLE_TICK_MS;
+    if (ticker && tickerMs === want) return;
+    if (ticker) clearInterval(ticker);
+    tickerMs = want;
+    ticker = setInterval(() => render(ctx), want);
   }
 
   pi.on("session_start", async (_e, ctx) => arm(ctx, true));
@@ -196,14 +239,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async (_e, ctx) => {
     turnStart = Date.now();
     stepInTurn = 0;
-    if (!ticker) arm(ctx, false);
+    schedule(ctx);
     render(ctx);
   });
 
   pi.on("before_provider_request", async (_e, ctx) => {
     dispatchAt = Date.now();
     firstTokenAt = undefined;
-    if (!ticker) arm(ctx, false); // keep the working row ticking
+    schedule(ctx); // keep the working row ticking
     renderWorking(ctx);
   });
 
@@ -242,7 +285,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (_e, ctx) => {
     stepInTurn++;
-    if (!ticker) arm(ctx, false);
+    schedule(ctx);
     render(ctx);
   });
 
@@ -261,12 +304,16 @@ export default function (pi: ExtensionAPI) {
       turnCount++;
     }
     turnStart = undefined;
+    dispatchAt = undefined;
     render(ctx);
+    schedule(ctx);
   });
 
   pi.on("session_shutdown", async (_e, ctx) => {
     if (ticker) clearInterval(ticker);
     ticker = undefined;
+    tickerMs = undefined;
+    lastStatus = undefined;
     ctx.ui.setStatus(STATUS_KEY, undefined);
     try {
       ctx.ui.setWorkingMessage();
@@ -274,6 +321,12 @@ export default function (pi: ExtensionAPI) {
       /* ignore */
     }
   });
+}
+
+/** Minute precision for the idle footer: 0m · 3m · 1h02m */
+function durMinutes(ms: number): string {
+  const m = Math.floor(Math.max(0, ms) / 60000);
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
 }
 
 /** 1.2s · 45s · 3m07s · 1h02m */

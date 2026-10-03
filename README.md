@@ -93,7 +93,11 @@ end-to-end latency rather than true prefill, since nothing streamed early.
 - The session clock also resets on `session_before_switch` / `session_before_fork`,
   so resuming an old session does not report its original age.
 - All rendering is wrapped in try/catch; a telemetry failure never breaks a request.
-- Updates at 4 Hz while active.
+- Updates at 4 Hz while the agent works. While idle it re-checks every 15 s and
+  re-sends the footer only when its text changes; the `session` clock shows whole
+  minutes while idle. Every footer update makes pi re-render its TUI, and that cost
+  grows with the transcript, so an idle pi with a long session now stays near 0% CPU
+  instead of re-rendering four times a second.
 
 ## License
 
