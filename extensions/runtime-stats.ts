@@ -43,8 +43,10 @@ const STATUS_KEY = "runtime-stats";
 const TICK_MS = 250;
 /** Idle cadence. The idle footer only changes once a minute, see durMinutes(). */
 const IDLE_TICK_MS = 15_000;
-/** Decode window shorter than this fraction of the response ⇒ treat as buffered. */
+/** Decode window shorter than this fraction of the response ⇒ possibly buffered… */
 const BULK_RATIO = 0.05;
+/** …and only if the implied rate is also impossible for one streamed response. */
+const BULK_MIN_RATE = 2000; // tokens/s
 
 type Usage = {
   input?: number;
@@ -270,8 +272,8 @@ export default function (pi: ExtensionAPI) {
         lastPrefillMs = total;
         lastDecodeMs = 0;
       }
-      lastWasBulk = total > 0 && lastDecodeMs / total < BULK_RATIO;
       lastOutputTokens = event?.message?.usage?.output;
+      lastWasBulk = isBulk(total, lastDecodeMs, lastOutputTokens);
     }
     dispatchAt = undefined;
     firstTokenAt = undefined;
@@ -321,6 +323,17 @@ export default function (pi: ExtensionAPI) {
       /* ignore */
     }
   });
+}
+
+/**
+ * A buffered response delivers all tokens at once: the decode window is a tiny
+ * share of the response AND the implied rate is implausible. The rate check keeps
+ * a normal stream after a long TTFT (e.g. a cold prefill) from being flagged.
+ */
+function isBulk(totalMs: number, decodeMs: number, outputTokens: number | undefined): boolean {
+  if (totalMs <= 0 || decodeMs / totalMs >= BULK_RATIO) return false;
+  if (!outputTokens || decodeMs <= 0) return true;
+  return outputTokens / (decodeMs / 1000) > BULK_MIN_RATE;
 }
 
 /** Minute precision for the idle footer: 0m · 3m · 1h02m */

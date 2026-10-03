@@ -78,8 +78,11 @@ emit every SSE event at once. First and last token arrive together, the decode
 window collapses to near zero, and tokens/second computed from it would be
 nonsense — a 1,800-character response "generated" in 30 ms.
 
-Those responses are detected (decode window under 5% of total response time) and
-reported as:
+Those responses are detected and reported as shown below. A response counts as
+buffered when its decode window is under 5% of the total response time **and** the
+implied rate is above 2,000 tokens/s. The rate check matters: after a long
+time-to-first-token (for example a cold prefill on a self-hosted server) a normal
+stream also has a small decode share, but it decodes at a plausible rate.
 
 ```text
 decode n/a(bulk)

@@ -1,6 +1,6 @@
 {
   "name": "pi-runtime-stats",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension: turn/step timing, TTFT, decode rate, prompt-cache hit rates and session busy ratio in the footer, plus a live per-request timer",
   "type": "module",
   "license": "MIT",
