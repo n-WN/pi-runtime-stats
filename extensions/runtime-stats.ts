@@ -4,16 +4,27 @@
  * Adds timing and cache telemetry to pi's footer, and turns the "Working…"
  * row into a live per-request timer.
  *
- * Footer:
- *   turn 4.2s      wall time of the current prompt (agent_start → agent_settled)
- *   step 3         LLM round-trips inside that turn
- *   prefill 3.8s   dispatch → first streamed token (TTFT)
- *   decode 120t/s  output rate measured over the streaming window
- *   cache 99.8%    prompt-cache hit rate of the latest LLM call
- *   avg 74.8%      prompt-cache hit rate across the whole session
- *   session 12m03s wall time since the session started (minutes while idle)
- *   busy 68%       share of session time the agent was actually working
- *   turns 7        completed turns
+ * Footer, one line in three groups:
+ *
+ *   turn 4.2s  step 3 │ call 8.4k→120  prefill 3.8s  decode 120t/s  via bedrock  retry 1 │ session 12m03s  busy 68%  turns 7  hit 74.8%  errors 2
+ *
+ *   turn      wall time of the current prompt (agent_start → agent_settled)
+ *   step      LLM round-trips inside that turn
+ *   call      prompt tokens → output tokens of the latest LLM call
+ *   prefill   dispatch → first streamed token (TTFT)
+ *   decode    output rate measured over the streaming window
+ *   via       upstream behind an Anthropic-compatible gateway (Bedrock, Vertex or the
+ *             Anthropic API, from the message id), once a session has seen more than one
+ *   retry     attempts the gateway needed before the call succeeded, when it says so
+ *             (GPT-Load's x-gptload-attempts header)
+ *   session   wall time since the session started (minutes while idle)
+ *   busy      share of session time the agent was actually working
+ *   turns     completed turns
+ *   hit       prompt-cache hit rate across the whole session
+ *   errors    LLM calls that failed in this session
+ *
+ * pi's own footer already shows the latest call's cache hit rate (CH) and the
+ * session token totals; this line does not repeat them.
  *
  * Working row:
  *   waiting 12.4s (no first token)
@@ -73,6 +84,14 @@ export default function (pi: ExtensionAPI) {
   let lastDecodeMs: number | undefined;
   let lastOutputTokens: number | undefined;
   let lastWasBulk = false;
+  let lastPromptTokens: number | undefined;
+  let lastBackend: string | undefined;
+  let lastAttempts: number | undefined;
+  /** Gateway attempts reported in the response headers of the call in flight. */
+  let pendingAttempts: number | undefined;
+  /** Upstreams seen in this session; `via` shows only when there is more than one. */
+  const backendsSeen = new Set<string>();
+  let errorCount = 0;
 
   let ticker: ReturnType<typeof setInterval> | undefined;
   let tickerMs: number | undefined;
@@ -85,14 +104,9 @@ export default function (pi: ExtensionAPI) {
   let sumInput = 0;
   let sumRead = 0;
   let sumWrite = 0;
-  let lastNow: number | undefined;
 
-  /**
-   * Walks session entries once and derives both cache figures.
-   * `now` reproduces pi's built-in CH indicator (latest assistant message);
-   * `avg` is the cumulative session ratio.
-   */
-  function cacheHits(ctx: ExtensionContext): { now?: number; avg?: number } {
+  /** Prompt-cache hit rate across the session, from the usage of every session entry. */
+  function sessionHitRate(ctx: ExtensionContext): number | undefined {
     try {
       const entries = ctx.sessionManager.getEntries() as any[];
       // Rescan from the start when the entry list is not an extension of the last scan
@@ -102,12 +116,9 @@ export default function (pi: ExtensionAPI) {
         sumInput = 0;
         sumRead = 0;
         sumWrite = 0;
-        lastNow = undefined;
       }
       for (; scanned < entries.length; scanned++) {
         const entry = entries[scanned];
-        const isAssistant =
-          entry?.type === "message" && entry.message?.role === "assistant";
         const u: Usage | undefined =
           entry?.type === "message"
             ? entry.message?.usage
@@ -119,18 +130,13 @@ export default function (pi: ExtensionAPI) {
         sumInput += u.input ?? 0;
         sumRead += u.cacheRead ?? 0;
         sumWrite += u.cacheWrite ?? 0;
-
-        if (isAssistant) {
-          const prompt = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
-          lastNow = prompt > 0 ? ((u.cacheRead ?? 0) / prompt) * 100 : undefined;
-        }
       }
       lastScannedEntry = entries[scanned - 1];
     } catch {
-      return {};
+      return undefined;
     }
     const prompt = sumInput + sumRead + sumWrite;
-    return { now: lastNow, avg: prompt > 0 ? (sumRead / prompt) * 100 : undefined };
+    return prompt > 0 ? (sumRead / prompt) * 100 : undefined;
   }
 
   /** Live per-request timer in the "Working…" row. */
@@ -154,41 +160,50 @@ export default function (pi: ExtensionAPI) {
     renderWorking(ctx);
     try {
       const t = ctx.ui.theme;
-      const parts: string[] = [];
       const kv = (label: string, value: string, hot = false) =>
         t.fg("muted", `${label} `) + t.fg(hot ? "accent" : "dim", value);
 
+      const turn: string[] = [];
       if (turnStart !== undefined) {
-        parts.push(kv("turn", dur(Date.now() - turnStart), true));
-        if (stepInTurn > 0) parts.push(kv("step", String(stepInTurn), true));
+        turn.push(kv("turn", dur(Date.now() - turnStart), true));
+        if (stepInTurn > 0) turn.push(kv("step", String(stepInTurn), true));
       } else if (lastTurnMs !== undefined) {
-        parts.push(kv("turn", dur(lastTurnMs)));
-        if (stepInTurn > 0) parts.push(kv("step", String(stepInTurn)));
+        turn.push(kv("turn", dur(lastTurnMs)));
+        if (stepInTurn > 0) turn.push(kv("step", String(stepInTurn)));
       }
 
-      if (lastPrefillMs !== undefined) parts.push(kv("prefill", dur(lastPrefillMs)));
+      const call: string[] = [];
+      if (lastPromptTokens !== undefined && lastOutputTokens !== undefined) {
+        call.push(kv("call", `${tokens(lastPromptTokens)}→${tokens(lastOutputTokens)}`));
+      }
+      if (lastPrefillMs !== undefined) call.push(kv("prefill", dur(lastPrefillMs)));
       if (lastDecodeMs !== undefined) {
         if (lastWasBulk) {
-          parts.push(kv("decode", "n/a(bulk)"));
+          call.push(kv("decode", "n/a(bulk)"));
         } else if (lastOutputTokens && lastDecodeMs > 0) {
           const tps = lastOutputTokens / (lastDecodeMs / 1000);
-          parts.push(kv("decode", `${tps.toFixed(0)}t/s`));
+          call.push(kv("decode", `${tps.toFixed(0)}t/s`));
         }
       }
+      if (lastBackend && backendsSeen.size > 1) call.push(kv("via", lastBackend));
+      if (lastAttempts !== undefined && lastAttempts > 1) call.push(kv("retry", String(lastAttempts - 1)));
 
-      const { now, avg } = cacheHits(ctx);
-      if (now !== undefined) parts.push(kv("cache", `${now.toFixed(1)}%`));
-      if (avg !== undefined) parts.push(kv("avg", `${avg.toFixed(1)}%`));
-
+      const session: string[] = [];
       const elapsed = Date.now() - sessionStart;
-      parts.push(kv("session", isBusy() ? dur(elapsed) : durMinutes(elapsed)));
+      session.push(kv("session", isBusy() ? dur(elapsed) : durMinutes(elapsed)));
       const liveBusy = busyMs + (turnStart !== undefined ? Date.now() - turnStart : 0);
       if (elapsed > 0 && liveBusy > 0) {
-        parts.push(kv("busy", `${Math.min(100, (liveBusy / elapsed) * 100).toFixed(0)}%`));
+        session.push(kv("busy", `${Math.min(100, (liveBusy / elapsed) * 100).toFixed(0)}%`));
       }
-      if (turnCount > 0) parts.push(kv("turns", String(turnCount)));
+      if (turnCount > 0) session.push(kv("turns", String(turnCount)));
+      const hit = sessionHitRate(ctx);
+      if (hit !== undefined) session.push(kv("hit", `${hit.toFixed(1)}%`));
+      if (errorCount > 0) session.push(t.fg("muted", "errors ") + t.fg("warning", String(errorCount)));
 
-      const status = parts.join(t.fg("muted", "  "));
+      const status = [turn, call, session]
+        .filter((group) => group.length > 0)
+        .map((group) => group.join(t.fg("muted", "  ")))
+        .join(t.fg("dim", " │ "));
       if (status !== lastStatus) {
         lastStatus = status;
         ctx.ui.setStatus(STATUS_KEY, status);
@@ -214,6 +229,12 @@ export default function (pi: ExtensionAPI) {
       lastDecodeMs = undefined;
       lastOutputTokens = undefined;
       lastWasBulk = false;
+      lastPromptTokens = undefined;
+      lastBackend = undefined;
+      lastAttempts = undefined;
+      pendingAttempts = undefined;
+      backendsSeen.clear();
+      errorCount = 0;
     }
     schedule(ctx);
     render(ctx);
@@ -252,6 +273,11 @@ export default function (pi: ExtensionAPI) {
     renderWorking(ctx);
   });
 
+  pi.on("after_provider_response", async (event) => {
+    const attempts = Number(headerValue(event.headers, "x-gptload-attempts"));
+    pendingAttempts = Number.isFinite(attempts) && attempts > 0 ? attempts : undefined;
+  });
+
   pi.on("message_update", async (_e, ctx) => {
     if (dispatchAt !== undefined && firstTokenAt === undefined) {
       firstTokenAt = Date.now();
@@ -261,20 +287,33 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event: any, ctx) => {
-    if (event?.message?.role !== "assistant") return;
-    const end = Date.now();
-    if (dispatchAt !== undefined) {
-      const total = end - dispatchAt;
-      if (firstTokenAt !== undefined) {
-        lastPrefillMs = firstTokenAt - dispatchAt;
-        lastDecodeMs = end - firstTokenAt;
-      } else {
-        lastPrefillMs = total;
-        lastDecodeMs = 0;
+    const message = event?.message;
+    if (message?.role !== "assistant") return;
+    // A failed call only counts as an error: its round-trip is no prefill, and it
+    // keeps the figures of the last call that worked.
+    if (message.stopReason === "error") {
+      errorCount++;
+    } else {
+      const end = Date.now();
+      if (dispatchAt !== undefined) {
+        const total = end - dispatchAt;
+        if (firstTokenAt !== undefined) {
+          lastPrefillMs = firstTokenAt - dispatchAt;
+          lastDecodeMs = end - firstTokenAt;
+        } else {
+          lastPrefillMs = total;
+          lastDecodeMs = 0;
+        }
+        lastOutputTokens = message.usage?.output;
+        lastWasBulk = isBulk(total, lastDecodeMs, lastOutputTokens);
       }
-      lastOutputTokens = event?.message?.usage?.output;
-      lastWasBulk = isBulk(total, lastDecodeMs, lastOutputTokens);
+      const u: Usage | undefined = message.usage;
+      if (u) lastPromptTokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+      lastBackend = backendOf(message.responseId);
+      if (lastBackend) backendsSeen.add(lastBackend);
+      lastAttempts = pendingAttempts;
     }
+    pendingAttempts = undefined;
     dispatchAt = undefined;
     firstTokenAt = undefined;
     try {
@@ -334,6 +373,28 @@ function isBulk(totalMs: number, decodeMs: number, outputTokens: number | undefi
   if (totalMs <= 0 || decodeMs / totalMs >= BULK_RATIO) return false;
   if (!outputTokens || decodeMs <= 0) return true;
   return outputTokens / (decodeMs / 1000) > BULK_MIN_RATE;
+}
+
+/** The upstream behind an Anthropic-compatible endpoint, from the message id prefix. */
+function backendOf(responseId: unknown): string | undefined {
+  if (typeof responseId !== "string") return undefined;
+  if (responseId.startsWith("msg_bdrk")) return "bedrock";
+  if (responseId.startsWith("msg_vrtx")) return "vertex";
+  if (/^msg_0[0-9]/.test(responseId)) return "anthropic";
+  return undefined;
+}
+
+/** A response header, whatever the case of its name. */
+function headerValue(headers: Record<string, string> | undefined, name: string): string | undefined {
+  for (const [key, value] of Object.entries(headers ?? {})) if (key.toLowerCase() === name) return value;
+  return undefined;
+}
+
+/** 950 · 8.4k · 1.2M */
+function tokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
 /** Minute precision for the idle footer: 0m · 3m · 1h02m */
