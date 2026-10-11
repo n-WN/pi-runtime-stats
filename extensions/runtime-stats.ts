@@ -289,9 +289,10 @@ export default function (pi: ExtensionAPI) {
     const message = event?.message;
     if (message?.role !== "assistant") return;
     // A failed call only counts as an error: its round-trip is no prefill, and it
-    // keeps the figures of the last call that worked.
+    // keeps the figures of the last call that worked. pi 1.x ends a call that Esc
+    // stops with stopReason "error" too; that is the user, so it is not counted.
     if (message.stopReason === "error") {
-      errorCount++;
+      if (!ctx.signal?.aborted) errorCount++;
     } else {
       const end = Date.now();
       if (dispatchAt !== undefined) {
