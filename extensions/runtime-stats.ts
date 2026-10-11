@@ -254,10 +254,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_e, ctx) => arm(ctx, true));
-  // session_start does not fire again on resume/fork, so without these the
-  // session clock would carry over from the previous session.
-  pi.on("session_before_switch", async (_e, ctx) => arm(ctx, true));
-  pi.on("session_before_fork", async (_e, ctx) => arm(ctx, true));
+  // pi 1.x gives /new, /resume and /fork a new extension runtime: session_start (with its reason)
+  // arms the new one and session_shutdown stops the old one. Arming on session_before_switch or
+  // session_before_fork reset the counters too early: another extension can cancel those.
 
   pi.on("agent_start", async (_e, ctx) => {
     turnStart = Date.now();
