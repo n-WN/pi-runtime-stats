@@ -141,7 +141,21 @@ export default function (pi: ExtensionAPI) {
   let sumWrite = 0;
 
   /** Prompt-cache hit rate across the session, from the usage of every session entry. */
+  // The session's entries as of the last scan: getEntries() copies the whole session, so it runs only when
+  // they changed (the footer and other extensions ask on every frame).
+  let hitKey = "";
+  let hitRate: number | undefined;
+
   function sessionHitRate(ctx: ExtensionContext): number | undefined {
+    const sm = ctx.sessionManager as typeof ctx.sessionManager & { getEntryCount?: () => number };
+    const key = typeof sm.getEntryCount === "function" ? `${sm.getSessionId()}|${sm.getLeafId()}|${sm.getEntryCount()}` : "";
+    if (key && key === hitKey) return hitRate;
+    hitRate = scanHitRate(ctx);
+    hitKey = key;
+    return hitRate;
+  }
+
+  function scanHitRate(ctx: ExtensionContext): number | undefined {
     try {
       const entries = ctx.sessionManager.getEntries() as any[];
       // Rescan from the start when the entry list is not an extension of the last scan
@@ -206,7 +220,10 @@ export default function (pi: ExtensionAPI) {
       via: lastBackend && backendsSeen.size > 1 ? lastBackend : undefined,
       retries: lastAttempts !== undefined && lastAttempts > 1 ? lastAttempts - 1 : undefined,
       errors: errorCount,
-      sessionHit: sessionHitRate(ctx),
+      // Computed when read: a presenter that does not show it pays nothing.
+      get sessionHit() {
+        return sessionHitRate(ctx);
+      },
       sessionStart,
       busyMs: busyMs + (turnStart !== undefined ? Date.now() - turnStart : 0),
       turns: turnCount,
