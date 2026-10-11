@@ -43,6 +43,10 @@
  * figure computed from it would be meaningless. Those responses are detected
  * and reported as `decode n/a(bulk)` instead of an invented number.
  *
+ * Other extensions can show these figures themselves: the latest values are published as
+ * `globalThis[Symbol.for("pi-runtime-stats.snapshot")]()` (see RuntimeSnapshot). When one
+ * sets `globalThis[Symbol.for("pi-runtime-stats.presenter")]`, this line is not sent.
+ *
  * Cost: every ctx.ui.setStatus() call makes pi re-render the whole TUI, and the
  * render cost grows with the transcript. So the footer is re-sent only when its
  * text changes, the 4 Hz ticker runs only while the agent works, and the idle
@@ -51,6 +55,37 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_KEY = "runtime-stats";
+const SNAPSHOT = Symbol.for("pi-runtime-stats.snapshot");
+const PRESENTER = Symbol.for("pi-runtime-stats.presenter");
+
+/** The figures of the footer line, for an extension that presents them itself. */
+export interface RuntimeSnapshot {
+  /** Start of the turn in progress (epoch ms); undefined while idle. */
+  turnStart?: number;
+  lastTurnMs?: number;
+  /** LLM round-trips in the current (or last) turn. */
+  steps: number;
+  /** Prompt tokens → output tokens of the latest call. */
+  promptTokens?: number;
+  outputTokens?: number;
+  /** Time to the first token of the latest call. */
+  prefillMs?: number;
+  /** Output tokens per second of the latest call; undefined when unknown or buffered. */
+  decodeRate?: number;
+  /** The latest response arrived in one piece (decode rate unknown). */
+  bulk: boolean;
+  /** Upstream behind an Anthropic-compatible gateway, when the session has seen more than one. */
+  via?: string;
+  /** Gateway retries of the latest call, when there were any. */
+  retries?: number;
+  errors: number;
+  /** Prompt-cache hit rate across the session, percent. */
+  sessionHit?: number;
+  /** Session start (epoch ms) and the time the agent worked. */
+  sessionStart: number;
+  busyMs: number;
+  turns: number;
+}
 const TICK_MS = 250;
 /** Idle cadence. The idle footer only changes once a minute, see durMinutes(). */
 const IDLE_TICK_MS = 15_000;
@@ -156,8 +191,45 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function snapshot(ctx: ExtensionContext): RuntimeSnapshot {
+    const decodeRate =
+      !lastWasBulk && lastDecodeMs && lastDecodeMs > 0 && lastOutputTokens ? lastOutputTokens / (lastDecodeMs / 1000) : undefined;
+    return {
+      turnStart,
+      lastTurnMs,
+      steps: stepInTurn,
+      promptTokens: lastPromptTokens,
+      outputTokens: lastOutputTokens,
+      prefillMs: lastPrefillMs,
+      decodeRate,
+      bulk: lastWasBulk,
+      via: lastBackend && backendsSeen.size > 1 ? lastBackend : undefined,
+      retries: lastAttempts !== undefined && lastAttempts > 1 ? lastAttempts - 1 : undefined,
+      errors: errorCount,
+      sessionHit: sessionHitRate(ctx),
+      sessionStart,
+      busyMs: busyMs + (turnStart !== undefined ? Date.now() - turnStart : 0),
+      turns: turnCount,
+    };
+  }
+
+  // The figures for another extension, from the session on screen only: an in-process
+  // subagent's session (no UI) loads this extension too and must not replace them.
+  let shownCtx: ExtensionContext | undefined;
+  const publish = (): RuntimeSnapshot | undefined => (shownCtx ? snapshot(shownCtx) : undefined);
+
   function render(ctx: ExtensionContext) {
     renderWorking(ctx);
+    if (ctx.hasUI) {
+      shownCtx = ctx;
+      (globalThis as Record<symbol, unknown>)[SNAPSHOT] = publish;
+    }
+    // Another extension presents the figures: no footer line (each setStatus() re-renders pi).
+    if ((globalThis as Record<symbol, unknown>)[PRESENTER]) {
+      if (lastStatus !== undefined) ctx.ui.setStatus(STATUS_KEY, undefined);
+      lastStatus = undefined;
+      return;
+    }
     try {
       const t = ctx.ui.theme;
       const kv = (label: string, value: string, hot = false) =>
@@ -351,6 +423,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_e, ctx) => {
+    if ((globalThis as Record<symbol, unknown>)[SNAPSHOT] === publish) delete (globalThis as Record<symbol, unknown>)[SNAPSHOT];
+    shownCtx = undefined;
     if (ticker) clearInterval(ticker);
     ticker = undefined;
     tickerMs = undefined;

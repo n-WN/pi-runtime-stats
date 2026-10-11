@@ -114,6 +114,23 @@ end-to-end latency rather than true prefill, since nothing streamed early.
   grows with the transcript, so an idle pi with a long session now stays near 0% CPU
   instead of re-rendering four times a second.
 
+## Using the figures in another extension
+
+The latest figures are published for the session on screen (sessions without a UI, such as
+in-process subagents, do not replace them):
+
+```ts
+const read = (globalThis as any)[Symbol.for("pi-runtime-stats.snapshot")];
+const stats = typeof read === "function" ? read() : undefined; // RuntimeSnapshot | undefined
+```
+
+`RuntimeSnapshot` (exported from `extensions/runtime-stats.ts`) has the turn in progress
+(`turnStart`, `steps`), the latest call (`promptTokens`, `outputTokens`, `prefillMs`,
+`decodeRate`, `bulk`, `via`, `retries`), and the session (`errors`, `sessionHit`,
+`sessionStart`, `busyMs`, `turns`). An extension that shows these figures itself sets
+`globalThis[Symbol.for("pi-runtime-stats.presenter")]` to its name; this extension then
+sends no footer line (and its working-row message stays). Delete the key to get the line back.
+
 ## License
 
 MIT
